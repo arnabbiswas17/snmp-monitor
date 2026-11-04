@@ -1,0 +1,18 @@
+# secrets: SNMP community / SNMPv3 passwords / device IP (copy config.env.example)
+config.env
+
+# spreadsheets (router data)
+*.xlsx
+.~lock.*#
+
+# collected traffic data
+backend/traffic*.db*
+backend/rrd/
+backend/rrd-demo/
+
+# dependencies / build output
+backend/.venv/
+__pycache__/
+frontend/node_modules/
+frontend/dist/
+*.log
