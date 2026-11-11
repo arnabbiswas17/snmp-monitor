@@ -41,6 +41,18 @@ INTERVAL = float(os.getenv("POLL_INTERVAL", "1"))
 RAW_RETENTION_HOURS = int(os.getenv("RAW_RETENTION_HOURS", "48"))
 AGG_RETENTION_DAYS = int(os.getenv("AGG_RETENTION_DAYS", "800"))
 
+
+def _iface_list(var):
+    return [s.strip() for s in os.getenv(var, "").replace(";", ",").split(",") if s.strip()]
+
+
+# Getting / Providing totals: which interfaces count (see config.env.example)
+#   getting   -> inbound from providers      providing -> outbound to downstream
+#   cache     -> inbound from cache servers   excluded  -> known internal links, never counted
+GROUPS = {g: _iface_list(f"{g.upper()}_IFACES") for g in ("getting", "providing", "cache", "excluded")}
+if DEMO and not any(GROUPS.values()):
+    GROUPS.update(getting=["ether1-WAN"], providing=["ether2-LAN", "ether5-Office", "wlan1-WiFi", "vlan10-Guest"])
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "traffic-demo.db" if DEMO else "traffic.db")
 RRD_BIN = shutil.which("rrdtool")
@@ -58,6 +70,9 @@ MAX_GAP = 30 * 86400         # gaps longer than this are not spread over buckets
 # than this, the interface is treated as idle.
 STALE_SECONDS = float(os.getenv("STALE_SECONDS", "10"))
 POINT_GAP = max(5 * INTERVAL, 2 * STALE_SECONDS + 1)   # no live point is plotted for gaps longer than this
+# Devices refresh counters in steps (Junos ~5 s), so a single live point can be far off.
+# Totals use the rate over the last AVG_WINDOW seconds instead (counter difference).
+AVG_WINDOW = 60
 
 OID_IFX = "1.3.6.1.2.1.31.1.1.1"   # ifXTable
 
@@ -91,7 +106,7 @@ UPSERT = (
 
 # ---------------------------------------------------------------- state
 class Iface:
-    __slots__ = ("idx", "speed", "desc", "prev", "rt")
+    __slots__ = ("idx", "speed", "desc", "prev", "rt", "recent")
 
     def __init__(self, idx, speed, desc=""):
         self.idx = idx
@@ -99,6 +114,20 @@ class Iface:
         self.desc = desc                      # ifAlias (interface description on the device)
         self.prev = None                      # (ts, in_octets, out_octets)
         self.rt = deque(maxlen=RT_POINTS)     # (ts_ms, in_bps, out_bps)
+        self.recent = deque(maxlen=200)       # counter samples where the value changed (for avg_rate)
+
+    def avg_rate(self, now):
+        """(in_bps, out_bps) over the last AVG_WINDOW seconds, from counter differences."""
+        if not self.recent:
+            return None
+        last = self.recent[-1]
+        if now - last[0] > 2 * STALE_SECONDS + AVG_WINDOW:
+            return (0.0, 0.0)                 # counters stopped changing: idle
+        first = next((s for s in self.recent if s[0] >= last[0] - AVG_WINDOW), last)
+        dt = last[0] - first[0]
+        if dt <= 0 or last[1] < first[1] or last[2] < first[2]:
+            return None
+        return ((last[1] - first[1]) * 8 / dt, (last[2] - first[2]) * 8 / dt)
 
 
 ifaces: dict[str, Iface] = {}
@@ -175,7 +204,9 @@ def advance(name, st, cur, record=True):
     r = calc(prev, cur)
     st.prev = cur
     if r is None:                       # counter reset
+        st.recent.clear()
         return None
+    st.recent.append(cur)
     dt, din, dout, ib, ob = r
     if record:
         add_interval(name, prev[0], cur[0], din, dout, ib, ob)
@@ -567,12 +598,15 @@ def get_status():
 
 @app.get("/api/interfaces")
 def get_interfaces():
-    out = []
+    out, now = [], time.time()
     for name, st in sorted(ifaces.items()):
         last = st.rt[-1] if st.rt else None
+        avg = st.avg_rate(now)
         out.append({"name": name, "speed_mbps": st.speed, "desc": st.desc,
                     "in_bps": last[1] if last else None,
-                    "out_bps": last[2] if last else None})
+                    "out_bps": last[2] if last else None,
+                    "in_avg_bps": avg[0] if avg else None,
+                    "out_avg_bps": avg[1] if avg else None})
     return out
 
 
@@ -634,6 +668,70 @@ def get_agg(
         "data_start": bounds[0] * 1000 if bounds and bounds[0] is not None else None,
         "data_end": (bounds[1] + BUCKET) * 1000 if bounds and bounds[1] is not None else None,
     }
+
+
+@app.get("/api/groups")
+def get_groups():
+    """The interface lists behind the Getting / Providing totals, plus sanity warnings.
+    `others` = sub-interfaces on the same parents that are in no list (so nothing is missed silently)."""
+    listed = [n for g in ("getting", "providing", "cache", "excluded") for n in GROUPS[g]]
+    warnings = []
+    seen = {}
+    for g in ("getting", "providing", "cache", "excluded"):
+        for n in GROUPS[g]:
+            if n in seen:
+                warnings.append(f"{n} is listed in both {seen[n]} and {g}")
+            seen[n] = g
+            if ifaces and n not in ifaces:
+                warnings.append(f"{n} ({g}) was not found on the device")
+    for n in listed:
+        if "." not in n and any(m.startswith(n + ".") for m in listed):
+            warnings.append(f"{n} and its sub-interfaces are both listed - traffic would be counted twice")
+    parents = {n.split(".")[0] for n in listed if "." in n}
+    others = sorted(n for n in ifaces if "." in n and n.split(".")[0] in parents and n not in seen)
+    return {**GROUPS, "others": others, "warnings": warnings}
+
+
+@app.get("/api/summary")
+def get_summary(
+    hours: int | None = Query(None, ge=1),
+    start: int | None = Query(None, description="epoch seconds"),
+    end: int | None = Query(None, description="epoch seconds"),
+):
+    """Getting / Providing / Cache totals from the stored 5-minute data.
+    Each point is the sum of the per-interface average rates in that period."""
+    now_b = int(time.time() // BUCKET) * BUCKET
+    if start is not None and end is not None:
+        since = int(start // BUCKET) * BUCKET
+        until = min(-(-int(end) // BUCKET) * BUCKET, now_b)
+    else:
+        since, until = now_b - max(1, (hours or 24) * 3600 // BUCKET) * BUCKET, now_b
+    member = {n: g for g in ("getting", "providing", "cache") for n in GROUPS[g]}
+    n = (until - since) // BUCKET
+    size = BUCKET * max(1, math.ceil(max(n, 1) / MAX_AGG_POINTS))
+    rows = []
+    if member and until > since:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            rows = conn.execute(
+                f"SELECT (bucket/?)*? AS b, iface, SUM(in_bytes), SUM(out_bytes), SUM(covered) FROM agg5m "
+                f"WHERE iface IN ({','.join('?' * len(member))}) AND bucket>=? AND bucket<? "
+                "GROUP BY b, iface ORDER BY b",
+                (size, size, *member, since, until)).fetchall()
+        finally:
+            conn.close()
+    points, totals = {}, {g: [0.0, 0.0] for g in ("getting", "providing", "cache")}
+    for b, name, bi, bo, cov in rows:
+        if cov <= 0:
+            continue
+        grp = member[name]
+        p = points.setdefault(b, {"t": b * 1000, **{f"{k}_{d}": 0.0 for k in totals for d in ("in", "out")}})
+        p[f"{grp}_in"] += bi * 8 / cov
+        p[f"{grp}_out"] += bo * 8 / cov
+        totals[grp][0] += bi
+        totals[grp][1] += bo
+    return {"step_seconds": size, "points": [points[k] for k in sorted(points)],
+            "total_bytes": {k: {"in": v[0], "out": v[1]} for k, v in totals.items()}}
 
 
 GRAPH_KEYS = ("image_width", "image_height", "graph_left", "graph_top",

@@ -3,6 +3,7 @@ import {
   Area, CartesianGrid, ComposedChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import CactiPanel from "./CactiPanel.jsx";
+import Summary from "./Summary.jsx";
 import { IN_COLOR, OUT_COLOR, Legend, fmtBps, fmtClock, pad } from "./common.jsx";
 
 const LIVE_KEEP = 900; // seconds (same as the backend ring buffer)
@@ -18,6 +19,8 @@ const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true });
 export default function App() {
   const [ifaces, setIfaces] = useState({});
   const [selected, setSelected] = useState("");
+  const [tab, setTab] = useState(location.hash === "#interfaces" ? "interfaces" : "summary");
+  const [groups, setGroups] = useState(null);
   const [live, setLive] = useState([]);
   const [liveWin, setLiveWin] = useState(300);
   const [wsOk, setWsOk] = useState(false);
@@ -37,13 +40,15 @@ export default function App() {
     let alive = true;
     async function load() {
       try {
-        const [list, st] = await Promise.all([
+        const [list, st, grp] = await Promise.all([
           fetch("/api/interfaces").then((r) => r.json()),
           fetch("/api/status").then((r) => r.json()),
+          fetch("/api/groups").then((r) => r.json()),
         ]);
         if (!alive) return;
         setNetError(null);
         setStatus(st);
+        setGroups(grp);
         setIfaces((prev) => {
           const next = {};
           for (const i of list) next[i.name] = { ...prev[i.name], ...i };
@@ -127,6 +132,17 @@ export default function App() {
   const label = (n) => `${n}${ifaces[n]?.desc ? `  (${ifaces[n].desc})` : ""}`
     + (ifaces[n]?.speed_mbps ? `  –  ${ifaces[n].speed_mbps} Mbps` : "");
 
+  function showTab(t) {
+    setTab(t);
+    history.replaceState(null, "", `#${t}`);
+  }
+  // from the Getting / Providing lists: open that interface's graphs
+  function openIface(n) {
+    setSelected(n);
+    showTab("interfaces");
+    window.scrollTo(0, 0);
+  }
+
   return (
     <div className="page">
       <header className="topbar">
@@ -140,18 +156,27 @@ export default function App() {
           </p>
         </div>
 
-        <label className="picker">
-          <span>Interface</span>
-          <select value={selected} onChange={(e) => setSelected(e.target.value)}>
-            {!names.length && <option value="">Waiting for data...</option>}
-            {names.map((n) => <option key={n} value={n}>{label(n)}</option>)}
-          </select>
-        </label>
+        {tab === "interfaces" && (
+          <label className="picker">
+            <span>Interface</span>
+            <select value={selected} onChange={(e) => setSelected(e.target.value)}>
+              {!names.length && <option value="">Waiting for data...</option>}
+              {names.map((n) => <option key={n} value={n}>{label(n)}</option>)}
+            </select>
+          </label>
+        )}
       </header>
+
+      <nav className="tabs">
+        <button className={tab === "summary" ? "on" : ""} onClick={() => showTab("summary")}>Getting &amp; Providing</button>
+        <button className={tab === "interfaces" ? "on" : ""} onClick={() => showTab("interfaces")}>
+          All interfaces <span className="count">{names.length}</span>
+        </button>      </nav>
 
       {error && <div className="error">{error}</div>}
 
-      {selected && (
+      {tab === "summary" && <Summary ifaces={ifaces} groups={groups} onOpen={openIface} />}
+      {tab === "interfaces" && selected && (
         <>
           <section className="now">
             <div>
